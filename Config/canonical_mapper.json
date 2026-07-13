@@ -1,0 +1,60 @@
+{
+    "product_id": [
+        "product_id",
+        "parent_asin",
+        "item_id",
+        "sku"
+    ],
+
+    "customer_id": [
+        "customer_id",
+        "user_id",
+        "buyer_id"
+    ],
+
+    "review_text": [
+        "review",
+        "review_text",
+        "feedback",
+        "comment",
+        "comments"
+    ],
+
+    "description": [
+        "description",
+        "details",
+        "product_description"
+    ],
+
+    "rating": [
+        "rating",
+        "stars",
+        "score",
+        "review_rating"
+    ],
+
+    "timestamp": [
+        "timestamp",
+        "date",
+        "created_at",
+        "review_date"
+    ],
+
+    "category": [
+        "category",
+        "categories",
+        "product_category"
+    ],
+
+    "price": [
+        "price",
+        "cost",
+        "amount"
+    ],
+
+    "brand": [
+        "brand",
+        "store",
+        "manufacturer"
+    ]
+}

@@ -1,0 +1,125 @@
+# intent_config.yaml
+# ============================================================
+# External intent routing configuration.
+# Add, remove, or edit intents here — NEVER in Python code.
+# ============================================================
+
+settings:
+  dominant_threshold: 1.2
+  gap_threshold: 0.4
+  low_confidence_threshold: 0.35
+  cache_size: 4096
+  normalizer:
+    strip_accents: true
+    casefold: true
+    remove_punctuation: true
+    collapse_whitespace: true
+  schema_boosts:
+    # intent -> schema attribute -> extra weight added to rule score
+    # when that attribute is non-empty on the SchemaContext passed
+    # into route().
+    structured:
+      numeric_columns: 0.4
+    trend:
+      time_columns: 0.6
+    semantic:
+      text_columns: 0.4
+
+intents:
+  structured:
+    patterns:
+      - ["\\b(count|average|avg|sum|total|top\\s*\\d+|highest|lowest|percentage|distribution|rank|group\\s+by|aggregate|metric|number\\s+of|how\\s+many)\\b", 1.0]
+      - ["\\b(table|row|column|field|schema|database|sql|select|where|join|filter|query)\\b", 0.8]
+
+  trend:
+    patterns:
+      - ["\\b(trend|increase|decrease|over\\s+time|monthly|quarterly|yearly|growth|drop|change|rise|fall|spike|decline|year[- ]over[- ]year|yoy|month[- ]over[- ]month|mom)\\b", 1.0]
+      - ["\\b(since|from\\s+\\d{4}|between\\s+\\d{4}|last\\s+\\d+\\s+(month|year|week|quarter))\\b", 0.7]
+
+  comparison:
+    patterns:
+      - ["\\b(compare|comparison|versus|vs\\.?|difference\\s+between|which\\s+is\\s+better|better\\s+than)\\b", 1.0]
+
+  semantic:
+    patterns:
+      - ["\\b(opinion|sentiment|feedback|experience|summarize|why\\s+do|what\\s+are\\s+the\\s+main|common\\s+theme|insight|perception|feel\\s+about)\\b", 1.0]
+      - ["\\b(aspect|topic|theme|keyword|phrase|context|meaning|describe|explain|elaborate|nuance)\\b", 0.6]
+
+  summarization:
+    patterns:
+      - ["\\b(summarize|summary|tl;?dr|overview|brief|condense|key\\s+points)\\b", 1.0]
+
+  qa:
+    patterns:
+      - ["\\b(what\\s+is|who\\s+is|when\\s+did|where\\s+is|define|definition\\s+of)\\b", 0.9]
+
+  entity_lookup:
+    patterns:
+      - ["\\b(find|lookup|look\\s+up|show\\s+me\\s+the\\s+record|details\\s+for|profile\\s+of)\\b", 0.9]
+
+routing:
+  structured:
+    needs_sql: true
+    needs_vector: false
+    needs_time_series: false
+    routing_path: "SQL"
+
+  trend:
+    needs_sql: true
+    needs_vector: false
+    needs_time_series: true
+    routing_path: "SQL"
+
+  comparison:
+    needs_sql: true
+    needs_vector: true
+    routing_path: "Hybrid"
+    extra_flags:
+      needs_comparison: true
+
+  semantic:
+    needs_sql: false
+    needs_vector: true
+    routing_path: "Qdrant"
+
+  summarization:
+    needs_sql: false
+    needs_vector: true
+    routing_path: "Qdrant"
+    extra_flags:
+      needs_summarization: true
+
+  qa:
+    needs_sql: false
+    needs_vector: true
+    routing_path: "Qdrant"
+    extra_flags:
+      needs_qa: true
+
+  entity_lookup:
+    needs_sql: true
+    needs_vector: false
+    routing_path: "SQL"
+    extra_flags:
+      needs_entity_lookup: true
+
+  hybrid:
+    needs_sql: true
+    needs_vector: true
+    routing_path: "Hybrid"
+
+# Optional: seed examples used to train the fallback ML classifier.
+# If omitted entirely, the classifier stage is skipped and routing
+# relies purely on the rule engine + schema boosts. Supply your own
+# domain examples here — there is nothing e-commerce-specific baked
+# into the router itself.
+training_examples:
+  structured:
+    - "how many records match this filter"
+    - "total count grouped by category"
+  trend:
+    - "show the trend over the last 12 months"
+    - "how has this metric changed since last year"
+  semantic:
+    - "what do people say about this topic"
+    - "summarize the general sentiment"
