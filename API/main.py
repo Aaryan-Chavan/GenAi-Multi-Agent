@@ -1,40 +1,92 @@
-# api/main.py
+# API/main.py
 """
-Application entrypoint.
+Application entrypoint -- interactive CLI mode.
 
-Creates and configures the FastAPI application: metadata, logging,
-middleware, CORS, router registration, global exception handlers, and
-startup/shutdown lifecycle. Contains no retrieval, LLM, SQL, vector-
-search, or business logic of its own -- that all lives in agents/,
-retrieval/, llm/, storage/, and evaluation/. Startup/shutdown here only
-call into api/dependencies.py to acquire/release the shared HybridAgent
-and RedisCache singletons; they do not construct or manage those
-resources directly.
+Run with:
+    python main.py                 -> interactive loop, type queries one at a time
+    python main.py "your query"    -> answers that one query, then exits
+    python main.py --skip-pipeline "your query"  -> skip the dataset pipeline check
+
+Builds StructuredAgent + SemanticAgent + AnswerGenerator -> HybridAgent
+directly (no FastAPI, no HTTP, no UI/, no Evaluation/) and sends each
+query straight to HybridAgent.run(). This is intentionally the same
+construction logic as API/dependencies.py's _build_hybrid_agent(), just
+called in-process instead of behind a web server -- once UI/ is ready,
+the FastAPI app in this same file's server mode (see git history / ask
+if you want it back) can be restored alongside this CLI without either
+one duplicating agent-construction logic.
+
+NOTE ON dataset_pipeline.py:
+dataset_pipeline.py is now a plain script (not a class) that exposes a
+single `main()` function. That function runs the full ingestion ->
+embeddings -> DuckDB/Qdrant pipeline stage-by-stage, and every stage
+already checks on its own whether its output exists / is valid before
+doing any work (e.g. it skips load/clean/map if CLEANED_DATA_FILE
+already exists, skips reloading DuckDB tables if row counts already
+match, skips regenerating embeddings if the .npy file is already on
+disk, skips reloading Qdrant if the vector count already matches).
+This means calling dataset_pipeline.main() on every launch is safe and
+cheap when everything is already built -- there is no separate
+status()/validate() call to make anymore, that logic now lives inside
+dataset_pipeline.py itself.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import logging.config
-from contextlib import asynccontextmanager
-from typing import AsyncIterator
+import sys
+from pathlib import Path
+from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Request, status
-from fastapi.exceptions import RequestValidationError
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.middleware.gzip import GZipMiddleware
-from fastapi.responses import JSONResponse
+# Make the project root importable regardless of the current working
+# directory (`python main.py` from inside API/, or `python API/main.py`
+# from the project root).
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
-from api.dependencies import get_hybrid_agent, get_redis_cache
-from api.routes import router as api_router
-from config.settings import LOG_FILE, LOG_LEVEL
+from Agents.hybrid_agent import HybridAgent, HybridAgentConfig, HybridResult
+from Agents.semantic_agent import (
+    EmbedConfig,
+    LLMConfig as SemanticLLMConfig,
+    QdrantConfig,
+    RetrievalConfig,
+    SchemaConfig as SemanticSchemaConfig,
+    SemanticAgent,
+)
+from Agents.structured_agent import AgentConfig, StructuredAgent
+from Config.settings import (
+    DUCKDB_FILE,
+    EMBEDDING_DEVICE,
+    EMBEDDING_MODEL,
+    LOG_FILE,
+    LOG_LEVEL,
+    MAX_RETRIEVAL_RESULTS,
+    QDRANT_COLLECTION,
+    QDRANT_HOST,
+    QDRANT_PORT,
+    TOP_K_DUCKDB,
+)
+from LLM.answer_generator import AnswerGenerator
 
-try:
-    from api.middleware import RequestIDMiddleware
-except ImportError:
-    RequestIDMiddleware = None  # type: ignore[assignment]
+# dataset_pipeline.py lives at the project root (sibling of API/, Agents/,
+# Config/, ...), importable once PROJECT_ROOT is on sys.path (see above).
+# It now exposes a single `main()` entrypoint -- alias it so it doesn't
+# collide with this file's own `main()` below.
+from dataset_pipeline import main as run_dataset_pipeline_stages
 
 logger = logging.getLogger(__name__)
+
+
+# ==========================================================
+# ERRORS
+# ==========================================================
+
+
+class DatasetPipelineError(Exception):
+    """Raised when dataset_pipeline.main() fails to complete."""
 
 
 # ==========================================================
@@ -43,26 +95,16 @@ logger = logging.getLogger(__name__)
 
 
 def _configure_logging() -> None:
-    """Configure application-wide logging using config/settings.py.
-    Runs once, at import time, before the FastAPI app is constructed,
-    so every module's logger is already configured when it first runs."""
     LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
-
     logging.config.dictConfig(
         {
             "version": 1,
             "disable_existing_loggers": False,
             "formatters": {
-                "default": {
-                    "format": "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
-                },
+                "default": {"format": "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"},
             },
             "handlers": {
-                "console": {
-                    "class": "logging.StreamHandler",
-                    "formatter": "default",
-                    "level": LOG_LEVEL,
-                },
+                "console": {"class": "logging.StreamHandler", "formatter": "default", "level": LOG_LEVEL},
                 "file": {
                     "class": "logging.handlers.RotatingFileHandler",
                     "formatter": "default",
@@ -73,158 +115,173 @@ def _configure_logging() -> None:
                     "encoding": "utf-8",
                 },
             },
-            "root": {
-                "level": LOG_LEVEL,
-                "handlers": ["console", "file"],
-            },
+            "root": {"level": LOG_LEVEL, "handlers": ["console", "file"]},
         }
     )
 
 
-_configure_logging()
-
-
 # ==========================================================
-# LIFESPAN  (startup / shutdown)
+# DATASET PIPELINE  (ingestion -> embeddings -> DuckDB/Qdrant, runs
+# BEFORE any agent is built -- HybridAgent reads from what this writes)
 # ==========================================================
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    """Initializes application-level resources on startup and releases
-    them on shutdown. Only acquires/releases the shared singletons
-    exposed by api/dependencies.py -- it does not construct retrieval,
-    LLM, or storage clients itself."""
-    logger.info("Application startup: acquiring shared service singletons")
-    try:
-        get_hybrid_agent()
-        get_redis_cache()
-    except Exception:
-        # A dependency being unavailable at boot (e.g. Qdrant/DuckDB/Redis
-        # not yet reachable) must not prevent the process from starting --
-        # /health will surface it as DEGRADED/UNHEALTHY per-service instead.
-        logger.exception("One or more service singletons failed to initialize at startup")
+def run_dataset_pipeline() -> None:
+    """Runs the full ingestion/embedding/storage pipeline via
+    dataset_pipeline.main().
 
-    yield
+    dataset_pipeline.main() is idempotent by design: every stage inside
+    it (load/clean/map, DuckDB load, embedding generation, quantization,
+    precomputed intelligence, Qdrant load) checks whether its expected
+    output already exists and matches the expected row/vector counts
+    before doing any work, and skips itself if so. That means it is
+    always safe (and normally cheap) to call this on every launch --
+    there's no separate "check status first" step anymore since that
+    logic now lives inside dataset_pipeline.py itself.
 
-    logger.info("Application shutdown: releasing shared service singletons")
+    Raises DatasetPipelineError (uncaught, by design) if the pipeline
+    cannot complete -- there is no point starting HybridAgent against a
+    DuckDB/Qdrant store the pipeline itself couldn't populate.
+    """
+    logger.info("Running dataset pipeline (stages skip themselves internally if already done)")
     try:
-        agent = get_hybrid_agent()
+        run_dataset_pipeline_stages()
+        logger.info("Dataset pipeline finished.")
+        print("Dataset pipeline: up to date.")
+    except Exception as exc:
+        raise DatasetPipelineError(f"Dataset pipeline failed: {exc}") from exc
+
+
+# ==========================================================
+# AGENT CONSTRUCTION  (same wiring as API/dependencies.py, no HTTP layer)
+# ==========================================================
+
+
+def build_hybrid_agent() -> HybridAgent:
+    logger.info("Building HybridAgent (StructuredAgent + SemanticAgent + AnswerGenerator)")
+
+    structured_agent = StructuredAgent(
+        db_path=str(DUCKDB_FILE),
+        max_rows=TOP_K_DUCKDB,
+        config=AgentConfig(max_row_limit=max(TOP_K_DUCKDB, MAX_RETRIEVAL_RESULTS)),
+    )
+
+    semantic_agent = SemanticAgent(
+        qdrant_cfg=QdrantConfig(
+            host=f"http://{QDRANT_HOST}:{QDRANT_PORT}",
+            collection=QDRANT_COLLECTION,
+        ),
+        embed_cfg=EmbedConfig(
+            model_name=EMBEDDING_MODEL,
+            device=None if EMBEDDING_DEVICE == "auto" else EMBEDDING_DEVICE,
+        ),
+        schema_cfg=SemanticSchemaConfig(),
+        retrieval_cfg=RetrievalConfig(),
+        llm_cfg=SemanticLLMConfig(),
+    )
+
+    answer_generator = AnswerGenerator()
+
+    return HybridAgent(
+        structured_agent=structured_agent,
+        semantic_agent=semantic_agent,
+        answer_generator=answer_generator,
+        config=HybridAgentConfig(),
+    )
+
+
+# ==========================================================
+# OUTPUT
+# ==========================================================
+
+
+def _print_result(result: HybridResult) -> None:
+    print(f"\nAnswer:\n{result.answer or '(no answer produced)'}")
+    print(f"\nConfidence: {result.overall_confidence:.2f}")
+    print(f"Execution path: {result.routing.mode.execution_path}")
+    print(f"Latency: {result.total_latency_ms:.1f}ms")
+    if result.errors:
+        print(f"Errors: {'; '.join(result.errors)}")
+    if result.warnings:
+        print(f"Warnings: {'; '.join(result.warnings)}")
+
+
+# ==========================================================
+# CLI
+# ==========================================================
+
+
+async def _run_one(agent: HybridAgent, query: str, conversation_id: str = "default") -> None:
+    result = await agent.run(query=query, conversation_id=conversation_id)
+    _print_result(result)
+
+
+async def _run_interactive(agent: HybridAgent) -> None:
+    print("Hybrid RAG -- interactive mode. Type a query, or 'exit'/'quit' to stop.")
+    conversation_id = "cli-session"
+    while True:
+        try:
+            query = input("\n> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            break
+        if not query:
+            continue
+        if query.lower() in ("exit", "quit"):
+            break
+        try:
+            await _run_one(agent, query, conversation_id)
+        except Exception:
+            logger.exception("Query failed: %r", query)
+            print("Something went wrong processing that query -- see logs for details.")
+
+
+async def _amain(argv: Optional[list] = None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    agent = build_hybrid_agent()
+    try:
+        if argv:
+            # python main.py "your query" -> single-shot mode
+            await _run_one(agent, " ".join(argv))
+        else:
+            # python main.py -> interactive loop, dynamic queries
+            await _run_interactive(agent)
+        return 0
+    finally:
         await agent.close()
-    except Exception:
-        logger.exception("Error while closing HybridAgent")
+
+
+def main() -> int:
+    _configure_logging()
+
+    argv = sys.argv[1:]
+    skip_pipeline = "--skip-pipeline" in argv
+    if skip_pipeline:
+        argv = [a for a in argv if a != "--skip-pipeline"]
+
+    if not skip_pipeline:
+        try:
+            run_dataset_pipeline()
+        except DatasetPipelineError:
+            logger.exception("Dataset pipeline failed -- not starting agents against an unready store")
+            print(
+                "Dataset pipeline failed; see logs for details. "
+                "Fix the dataset/config, or pass --skip-pipeline to bypass this check "
+                "if you know DuckDB/Qdrant are already populated."
+            )
+            return 1
+    else:
+        logger.info("--skip-pipeline passed; skipping dataset pipeline")
 
     try:
-        cache = get_redis_cache()
-        cache.close()
+        return asyncio.run(_amain(argv))
+    except KeyboardInterrupt:
+        print("\nInterrupted.")
+        return 130
     except Exception:
-        logger.exception("Error while closing RedisCache")
+        logger.exception("Fatal error building or running HybridAgent")
+        return 1
 
 
-# ==========================================================
-# APPLICATION FACTORY
-# ==========================================================
-
-
-def create_app() -> FastAPI:
-    app = FastAPI(
-        title="Hybrid RAG API",
-        description="Dataset-independent Hybrid Retrieval-Augmented Generation API.",
-        version="1.0.0",
-        docs_url="/docs",
-        redoc_url="/redoc",
-        openapi_url="/openapi.json",
-        lifespan=lifespan,
-    )
-
-    _register_middleware(app)
-    _register_routers(app)
-    _register_exception_handlers(app)
-
-    return app
-
-
-def _register_middleware(app: FastAPI) -> None:
-    if RequestIDMiddleware is not None:
-        app.add_middleware(RequestIDMiddleware)
-    else:
-        logger.warning("api.middleware.RequestIDMiddleware not found; request-ID correlation is disabled")
-
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=["*"],
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
-
-    app.add_middleware(GZipMiddleware, minimum_size=1024)
-
-
-def _register_routers(app: FastAPI) -> None:
-    app.include_router(api_router)
-
-
-def _register_exception_handlers(app: FastAPI) -> None:
-    @app.exception_handler(HTTPException)
-    async def _http_exception_handler(request: Request, exc: HTTPException) -> JSONResponse:
-        request_id = getattr(request.state, "request_id", None)
-        logger.warning(
-            "http_exception request_id=%s path=%s status=%s detail=%s",
-            request_id, request.url.path, exc.status_code, exc.detail,
-        )
-        return JSONResponse(
-            status_code=exc.status_code,
-            content={
-                "status": "error",
-                "error": {
-                    "code": str(exc.status_code),
-                    "message": exc.detail if isinstance(exc.detail, str) else "Request failed",
-                    "details": exc.detail if isinstance(exc.detail, dict) else None,
-                },
-                "metadata": {"request_id": str(request_id) if request_id else None},
-            },
-            headers=exc.headers,
-        )
-
-    @app.exception_handler(RequestValidationError)
-    async def _validation_exception_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
-        request_id = getattr(request.state, "request_id", None)
-        logger.warning(
-            "validation_error request_id=%s path=%s errors=%s",
-            request_id, request.url.path, exc.errors(),
-        )
-        return JSONResponse(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            content={
-                "status": "error",
-                "error": {
-                    "code": "422",
-                    "message": "Request validation failed.",
-                    "details": {"errors": exc.errors()},
-                },
-                "metadata": {"request_id": str(request_id) if request_id else None},
-            },
-        )
-
-    @app.exception_handler(Exception)
-    async def _unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
-        request_id = getattr(request.state, "request_id", None)
-        logger.exception(
-            "unhandled_exception request_id=%s path=%s", request_id, request.url.path,
-        )
-        return JSONResponse(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            content={
-                "status": "error",
-                "error": {
-                    "code": "500",
-                    "message": "An unexpected error occurred.",
-                    "details": None,
-                },
-                "metadata": {"request_id": str(request_id) if request_id else None},
-            },
-        )
-
-
-app = create_app()
+if __name__ == "__main__":
+    sys.exit(main())

@@ -23,6 +23,10 @@ Context tolerance
     - a single dict (including a `HybridResult.to_dict()`-shaped
       payload -- any list-of-dict values inside it are merged
       generically, without assuming specific key names)
+    - a dict containing a SQL-style `columns` + `rows` pair, where
+      `rows` may be a list of tuples/lists (e.g. DuckDB `fetchall()`
+      output) rather than pre-zipped dicts -- these are paired up
+      into `List[Dict[str, Any]]` here, at any nesting depth
     - a plain string (e.g. an already-compressed context block)
     - a generator/iterator (consumed exactly once)
     - a pandas DataFrame (duck-typed, so pandas is not a hard import)
@@ -203,6 +207,31 @@ class AnswerGenerator:
         AnswerType.GENERAL: "Use the context below, if any, to answer the question.",
     }
 
+    # --- Column/row pairing candidates -------------------------------
+    # SQL engines (DuckDB included) commonly return column names and
+    # row values as two separate structures (e.g. `cursor.description`
+    # + `fetchall()` tuples). These candidate keys let us recognize
+    # that shape wherever it appears in a context payload and zip it
+    # back into `List[Dict[str, Any]]` records, without hardcoding any
+    # dataset-specific column name.
+    _COLUMN_KEY_CANDIDATES: Sequence[str] = (
+        "columns", "column_names", "fields", "field_names", "headers",
+    )
+    _ROW_KEY_CANDIDATES: Sequence[str] = (
+        "rows", "data", "results", "records", "values",
+    )
+
+    # --- Pre-computed confidence signal candidates --------------------
+    # A HybridResult.to_dict()-shaped payload may carry these as
+    # top-level scalars alongside its list-of-dict fields. They must
+    # never be silently dropped just because they aren't part of any
+    # single context record.
+    _EXTERNAL_CONFIDENCE_KEYS: Sequence[str] = (
+        "execution_confidence", "sql_confidence", "structured_confidence",
+        "planner_confidence", "routing_confidence", "semantic_confidence",
+        "overall_confidence", "confidence",
+    )
+
     def __init__(
         self,
         qwen_client: Optional[QwenClient] = None,
@@ -303,14 +332,168 @@ class AnswerGenerator:
             return {f"value_{i}": v for i, v in enumerate(item)}
         return {"text": str(item)}
 
-    @staticmethod
-    def _validate_context(context: Any) -> List[Dict[str, Any]]:
+    @classmethod
+    def _zip_columns_rows(
+        cls, columns: Sequence[Any], rows: Sequence[Any],
+    ) -> Optional[List[Dict[str, Any]]]:
+        """
+        Pair a list of column names with a list of rows into
+        `List[Dict[str, Any]]`.
+
+        This is the shape most SQL drivers (DuckDB's `fetchall()`
+        included) naturally return: column names kept *separate* from
+        row tuples. Prior to this fix, that separation meant SQL
+        result rows never survived `_validate_context`'s "is this a
+        list of dicts?" check (tuples aren't dicts), so every
+        aggregated/aliased column silently vanished before reaching
+        the prompt.
+
+        Each row may itself already be a dict (passed through as-is,
+        so already-zipped input is unaffected), or a tuple/list
+        (zipped positionally against `columns`), or a bare scalar
+        (wrapped using the single column name, for single-column
+        result sets). Returns None if `columns` is empty or `rows`
+        isn't list-shaped, so callers can safely fall back to other
+        extraction strategies.
+        """
+        if not columns or not isinstance(rows, (list, tuple)):
+            return None
+        col_names = [str(c) for c in columns]
+        zipped: List[Dict[str, Any]] = []
+        for row in rows:
+            if isinstance(row, dict):
+                zipped.append(row)
+            elif isinstance(row, (list, tuple)):
+                zipped.append(
+                    {col_names[i]: value for i, value in enumerate(row) if i < len(col_names)}
+                )
+            else:
+                zipped.append({(col_names[0] if col_names else "value"): row})
+        return zipped
+
+    @classmethod
+    def _extract_records_from_mapping(
+        cls,
+        mapping: Dict[str, Any],
+        _depth: int = 0,
+        _seen: Optional[set] = None,
+        _max_depth: int = 4,
+    ) -> List[Dict[str, Any]]:
+        """
+        Recursively discover every context record hiding inside a
+        dict-shaped payload (typically a `HybridResult.to_dict()`
+        output), regardless of how deeply structured/semantic results
+        are nested.
+
+        Three extraction strategies are combined, all schema-agnostic
+        (no dataset column names, and no fixed wrapper-key names other
+        than generic container labels like "structured"/"rows" are
+        ever assumed to be *present* -- they're just checked for):
+
+          1. columns/rows pairing at this level (SQL-result shape --
+             see `_zip_columns_rows`), e.g.
+             {"columns": [...], "rows": [(...), (...)]}
+          2. any value that is already a `List[dict]` (original
+             behavior, preserved as-is for backward compatibility)
+          3. recursing into nested dict values, so a wrapper such as
+             {"structured": {"columns": [...], "rows": [...]},
+              "semantic": {"chunks": [...]}}
+             still yields every row/chunk instead of being silently
+             skipped because the top level itself isn't list-shaped.
+
+        `_seen` guards against reference cycles (defensive only --
+        ordinary JSON-shaped payloads can't cycle, but this is cheap
+        insurance for arbitrary Python objects passed in directly).
+        Depth is capped (default 4) purely as a sanity bound; realistic
+        HybridResult payloads are 1-2 levels deep.
+        """
+        if _depth > _max_depth or not isinstance(mapping, dict):
+            return []
+        if _seen is None:
+            _seen = set()
+        mapping_id = id(mapping)
+        if mapping_id in _seen:
+            return []
+        _seen.add(mapping_id)
+
+        collected: List[Dict[str, Any]] = []
+
+        # Strategy 1: columns/rows pairing at this level.
+        columns_val = None
+        for key in cls._COLUMN_KEY_CANDIDATES:
+            candidate = mapping.get(key)
+            if isinstance(candidate, (list, tuple)) and candidate:
+                columns_val = candidate
+                break
+        if columns_val is not None:
+            for key in cls._ROW_KEY_CANDIDATES:
+                rows_val = mapping.get(key)
+                if isinstance(rows_val, (list, tuple)) and rows_val:
+                    zipped = cls._zip_columns_rows(columns_val, rows_val)
+                    if zipped:
+                        collected.extend(zipped)
+                    break
+
+        # Strategy 2: values that are already List[dict] (original
+        # top-level-only behavior, now applied at every level visited).
+        for value in mapping.values():
+            if isinstance(value, (list, tuple)) and value and all(isinstance(x, dict) for x in value):
+                collected.extend(value)
+
+        # Strategy 3: recurse into nested dict values so wrapped
+        # structured/semantic payloads aren't skipped just because the
+        # container itself isn't directly list-shaped.
+        for value in mapping.values():
+            if isinstance(value, dict):
+                collected.extend(
+                    cls._extract_records_from_mapping(value, _depth + 1, _seen, _max_depth)
+                )
+
+        return collected
+
+    @classmethod
+    def _extract_external_confidences(cls, context: Any) -> Dict[str, float]:
+        """
+        Pull any pre-computed, top-level confidence signals out of a
+        dict-shaped context payload (execution_confidence,
+        sql_confidence, planner_confidence, routing_confidence,
+        semantic_confidence, ...) before that dict is reduced down to
+        its list-of-dict fields.
+
+        Previously these scalars sat right next to the
+        structured_facts/semantic_chunks lists and were discarded
+        the moment `_validate_context` found list fields to merge --
+        meaning a real `execution_confidence=1.00` from a successful
+        SQL run never influenced the final confidence at all, and was
+        silently replaced by a naive per-record-score average (which
+        SQL rows typically don't have, since scores are a semantic-
+        search concept). That produced exactly the
+        `execution_confidence=1.00` / `overall_confidence=0.41`
+        mismatch this fix addresses.
+
+        Never assumes a key is present; only includes ones that
+        actually exist and are numeric, each clamped into [0, 1].
+        """
+        found: Dict[str, float] = {}
+        if not isinstance(context, dict):
+            return found
+        for key in cls._EXTERNAL_CONFIDENCE_KEYS:
+            value = context.get(key)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                found[key] = max(0.0, min(float(value), 1.0))
+        return found
+
+    @classmethod
+    def _validate_context(cls, context: Any) -> List[Dict[str, Any]]:
         """
         Normalize arbitrary context input into `List[Dict[str, Any]]`.
 
         Accepts (without ever raising): None, dict (including
-        `HybridResult.to_dict()`-shaped payloads), list/tuple/set,
-        string, generator/iterator, duck-typed pandas DataFrame,
+        `HybridResult.to_dict()`-shaped payloads, with structured
+        results discovered at any nesting depth and SQL-style
+        columns/rows pairs zipped into records -- see
+        `_extract_records_from_mapping`), list/tuple/set, string,
+        generator/iterator, duck-typed pandas DataFrame,
         dataclasses/namedtuples, or any other object.
         """
         if context is None:
@@ -325,17 +508,8 @@ class AnswerGenerator:
                 LOGGER.debug("Context looked like a DataFrame but conversion failed; falling back.")
 
         if isinstance(context, dict):
-            # Generic merge of any list-of-dict values (e.g. a
-            # HybridResult.to_dict() payload's structured_facts /
-            # semantic_chunks) -- no dataset-specific key names assumed.
-            list_fields = [
-                v for v in context.values()
-                if isinstance(v, (list, tuple)) and v and all(isinstance(x, dict) for x in v)
-            ]
-            if list_fields:
-                merged: List[Dict[str, Any]] = []
-                for lst in list_fields:
-                    merged.extend(lst)
+            merged = cls._extract_records_from_mapping(context)
+            if merged:
                 return merged
             return [context]
 
@@ -348,7 +522,7 @@ class AnswerGenerator:
                 iterator = iter(context)
             except TypeError:
                 return [{"text": str(context)}]
-            return [AnswerGenerator._coerce_record(item) for item in iterator]
+            return [cls._coerce_record(item) for item in iterator]
 
         return [{"text": str(context)}]
 
@@ -379,14 +553,23 @@ class AnswerGenerator:
 
     def _analyze_context(
         self, records: List[Dict[str, Any]],
-    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], float]:
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], float, bool]:
         """
         One pass over normalized context records producing:
           - clean_records: deduplicated, length-capped, count-capped
             records ready for prompt construction (best-scored first)
           - sources: cleaned metadata for the caller (embedding/vector
             fields excluded, count-capped)
-          - confidence: average of any discovered relevance scores
+          - confidence: average of any discovered per-record relevance
+            scores (0.0 if none were found)
+          - had_scores: whether at least one record actually carried a
+            numeric score field. This is returned separately from
+            `confidence` so callers (see `generate`) can tell "no
+            score fields existed" apart from "scores existed and
+            averaged to zero" -- conflating the two previously caused
+            a real 0.0 to be blended into overall confidence even when
+            the record set (e.g. plain SQL rows) simply never carries
+            a per-row score to begin with.
 
         Exact-duplicate text is skipped cheaply via a hash set; items
         with no discoverable text field (e.g. pure structured rows)
@@ -394,7 +577,7 @@ class AnswerGenerator:
         similar rows may still be legitimately distinct records.
         """
         if not records:
-            return [], [], 0.0
+            return [], [], 0.0, False
 
         max_items = self._max_context_items()
         max_chars = self._max_item_chars()
@@ -415,7 +598,7 @@ class AnswerGenerator:
             scored.append((score_val, text_key, item))
 
         if not scored:
-            return [], [], 0.0
+            return [], [], 0.0, False
 
         # Best-scored evidence first, so truncation keeps what matters;
         # stable sort preserves relative order among unscored items.
@@ -478,7 +661,9 @@ class AnswerGenerator:
         #      appended to conf_scores),
         #   2. sort descending,
         #   3. average only the top 3 (or fewer, if fewer exist),
-        #   4. return 0.0 if no valid scores exist at all.
+        #   4. return 0.0 (and had_scores=False) if no valid scores
+        #      exist at all, so the caller can distinguish "no signal"
+        #      from "signal averaged to zero".
         # `conf_scores` is already populated in best-score-first order
         # because `scored` was sorted descending before this loop ran,
         # so no extra pass over the full record set is required here --
@@ -486,19 +671,21 @@ class AnswerGenerator:
         if conf_scores:
             top_scores = sorted(conf_scores, reverse=True)[:3]
             confidence = round(sum(top_scores) / len(top_scores), 3)
+            had_scores = True
         else:
             confidence = 0.0
-        return clean_records, sources, confidence
+            had_scores = False
+        return clean_records, sources, confidence, had_scores
 
     # Backward-compatible thin wrappers around _analyze_context, kept
     # in case anything calls these private helpers directly.
 
     def _format_sources(self, context: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        _, sources, _ = self._analyze_context(self._validate_context(context))
+        _, sources, _, _ = self._analyze_context(self._validate_context(context))
         return sources
 
     def _estimate_confidence(self, context: List[Dict[str, Any]]) -> float:
-        _, _, confidence = self._analyze_context(self._validate_context(context))
+        _, _, confidence, _ = self._analyze_context(self._validate_context(context))
         return confidence
 
     # ============================================================
@@ -773,12 +960,14 @@ class AnswerGenerator:
         Generate a grounded answer from `query` and `context`.
 
         `context` may be None, a list/tuple/set of dicts, a single
-        dict (including a HybridResult.to_dict()-shaped payload), a
-        string, a generator, a pandas DataFrame, or effectively
-        anything else -- it is normalized internally and this method
-        never raises due to context shape. On any internal failure a
-        structured `AnswerResult(success=False, error=...)` is
-        returned instead of propagating an exception.
+        dict (including a HybridResult.to_dict()-shaped payload -- now
+        with structured results discovered at any nesting depth and
+        SQL-style columns/rows pairs zipped into records), a string, a
+        generator, a pandas DataFrame, or effectively anything else --
+        it is normalized internally and this method never raises due
+        to context shape. On any internal failure a structured
+        `AnswerResult(success=False, error=...)` is returned instead of
+        propagating an exception.
         """
         start_time = time.time()
         self.total_requests += 1
@@ -795,7 +984,31 @@ class AnswerGenerator:
             return self._error_result(answer_type, exc, "invalid_query", start_time)
 
         records = self._validate_context(context)
-        clean_records, sources, confidence = self._analyze_context(records)
+        clean_records, sources, item_confidence, had_item_scores = self._analyze_context(records)
+
+        # --- Fix for Bug 6: preserve pre-computed confidence signals ---
+        # A dict-shaped payload may carry execution/planner/routing/
+        # semantic confidence as top-level scalars. Those must be
+        # blended into the final confidence instead of being discarded
+        # (previously) or diluted by a spurious 0.0 derived from SQL
+        # rows that simply don't have a per-row score field.
+        external_confidences = self._extract_external_confidences(context)
+        confidence_signals: List[float] = list(external_confidences.values())
+        if had_item_scores:
+            confidence_signals.append(item_confidence)
+
+        if confidence_signals:
+            confidence = round(sum(confidence_signals) / len(confidence_signals), 3)
+        elif clean_records:
+            # Grounded in real records, but no explicit confidence
+            # signal (external or per-item) was ever supplied. This is
+            # a neutral, non-zero default -- it must not be treated as
+            # "answer succeeded but confidence is untrustworthy" (0.0),
+            # since the presence of clean_records already means the
+            # answer is grounded in retrieved evidence.
+            confidence = 0.75
+        else:
+            confidence = 0.0
 
         warnings: List[str] = []
         if context is not None and not clean_records:
@@ -833,7 +1046,8 @@ class AnswerGenerator:
         result.metadata["formatted_context_characters"] = len(self._format_context(clean_records)) \
             if clean_records else 0
         result.metadata["prompt_build_latency_ms"] = round(prompt_latency_ms, 3)
-        result.metadata["context_confidence"] = confidence
+        result.metadata["context_confidence"] = item_confidence
+        result.metadata["external_confidence_signals"] = external_confidences
 
         latency = time.time() - start_time
         result.latency = round(latency, 3)
@@ -845,11 +1059,11 @@ class AnswerGenerator:
         # the prompt text itself or any raw user/context content.
         LOGGER.info(
             "Answer generated | query_hash=%s | answer_len=%d | answer_type=%s | "
-            "context_records=%d | sources=%d | confidence=%.3f | prompt_chars=%d | "
-            "prompt_build_ms=%.1f | total_latency=%.3f | prompt_tokens=%s | "
+            "context_records=%d | sources=%d | confidence=%.3f | external_confidence=%s | "
+            "prompt_chars=%d | prompt_build_ms=%.1f | total_latency=%.3f | prompt_tokens=%s | "
             "generated_tokens=%s | status=%s",
             QwenClient.hash_prompt(query), len(result.answer), result.answer_type,
-            len(clean_records), len(sources), confidence, len(prompt),
+            len(clean_records), len(sources), confidence, external_confidences, len(prompt),
             prompt_latency_ms, latency,
             result.metadata.get("prompt_tokens"), result.metadata.get("generated_tokens"), result.status,
         )
@@ -946,12 +1160,23 @@ if __name__ == "__main__":
         "structured_facts": [{"id": 1, "avg_rating": 4.2}],
         "semantic_chunks": [{"text": "Users report strong performance on multilingual tasks.", "score": 0.81}],
     }
+    # Regression case for Bug 1/2/3: SQL rows nested under a wrapper
+    # key, with columns/rows kept separate (DuckDB fetchall() shape),
+    # plus top-level execution confidence that must not be discarded.
+    sql_result_shaped = {
+        "structured": {
+            "columns": ["brand", "avg_rating"],
+            "rows": [("Acme", 4.6), ("Zenith", 3.8), ("Nova", 3.2)],
+        },
+        "execution_confidence": 1.0,
+    }
     plain_string_context = "Qwen3-14B was released as part of the Qwen3 model family."
     empty_context = None
 
     for label, ctx in (
         ("list[dict]", list_of_dicts),
         ("hybrid-result-shaped dict", hybrid_result_shaped),
+        ("nested SQL columns/rows dict", sql_result_shaped),
         ("plain string", plain_string_context),
         ("None", empty_context),
     ):

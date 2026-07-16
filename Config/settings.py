@@ -46,6 +46,19 @@ CLEANED_DATA_FILE = (
     CLEANED_DATA_DIR / "cleaned_dataset.csv"
 )
 
+MAPPED_DATA_FILE = (
+    PROCESSED_DATA_DIR / "mapped_dataset.csv"
+)
+
+# ============================================================
+# CANONICAL MAPPING
+# ============================================================
+
+CANONICAL_MAPPING_FILE = (
+    BASE_DIR / "Config" / "canonical_mapper.json"
+)
+
+
 # ============================================================
 # PREPROCESSING OUTPUTS
 # ============================================================
@@ -202,7 +215,7 @@ TEMPERATURE = 0.1
 
 TOP_P = 0.9
 
-MAX_CONTEXT_CHUNKS = 30
+MAX_CONTEXT_CHUNKS = 12
 
 # ============================================================
 # RETRIEVAL
@@ -225,6 +238,20 @@ LOG_FILE = (
     "application.log"
 )
 
+
+# ============================================================
+# DATASET PIPELINE  (required by dataset_pipeline.py)
+# ============================================================
+
+PIPELINE_STATE_FILE = (
+       DATA_DIR /
+       "pipeline_state.json"
+)
+
+PIPELINE_LOG_FILE = (
+       LOGS_DIR /
+       "pipeline.log"
+)
 # ============================================================
 # EVALUATION
 # ============================================================

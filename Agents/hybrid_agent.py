@@ -113,7 +113,7 @@ class HybridAgentConfig:
     # ---- Timeouts (per branch, per hybrid run) ----
     structured_timeout_seconds: float = 25.0
     semantic_timeout_seconds: float = 20.0
-    answer_timeout_seconds: float = 25.0
+    answer_timeout_seconds: float = 60.0
 
     # ---- Retry strategy ----
     enable_retry: bool = True
@@ -140,7 +140,7 @@ class HybridAgentConfig:
     weight_answer_confidence: float = 0.35
 
     # ---- Context assembly ----
-    max_context_items: int = 12
+    max_context_items: int = 8
     weight_confidence_in_ranking: float = 0.55
     weight_richness_in_ranking: float = 0.30
     weight_freshness_in_ranking: float = 0.05

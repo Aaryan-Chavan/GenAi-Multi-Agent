@@ -1460,6 +1460,7 @@ class QdrantLoader:
         self.client = QdrantClient(
             host=host or self.config.host,
             port=int(port or self.config.port),
+            timeout=120,
         )
 
     # =========================================================
@@ -1978,15 +1979,25 @@ class QdrantLoader:
             schema_type = _INDEX_TYPE_MAP.get(vtype)
             if schema_type is None:
                 continue
-            try:
-                self.client.create_payload_index(
-                    collection_name=self.collection_name,
-                    field_name=field_name,
-                    field_schema=schema_type,
-                )
-                logger.info("Created payload index: %s (%s)", field_name, vtype)
-            except Exception as exc:
-                logger.warning("Could not create payload index for '%s': %s", field_name, exc)
+
+            for attempt in range(3):
+                try:
+                    self.client.create_payload_index(
+                        collection_name=self.collection_name,
+                        field_name=field_name,
+                        field_schema=schema_type,
+                    )
+                    logger.info("Created payload index: %s (%s)", field_name, vtype)
+                    break
+                except Exception as exc:
+                    if attempt == 2:
+                        logger.warning("Could not create payload index for '%s': %s", field_name, exc)
+                    else:
+                        logger.warning(
+                            "Payload index attempt %d/3 failed for '%s': %s -- retrying",
+                            attempt + 1, field_name, exc,
+                        )
+                        time.sleep(2 ** attempt)
 
     # =========================================================
     # HELPERS

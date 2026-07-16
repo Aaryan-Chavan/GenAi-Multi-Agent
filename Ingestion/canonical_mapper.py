@@ -1,13 +1,35 @@
 import json
 import pandas as pd
 
+from Config import settings as _settings
+
+# Sourced from Config.settings like every other path in the pipeline
+# (CLEANED_DATA_FILE, RAW_DATA_FILE, etc.), instead of a hardcoded
+# relative path that only resolved when the process happened to be
+# launched from the project root.
+DEFAULT_CANONICAL_MAPPING_FILE = getattr(
+    _settings,
+    "CANONICAL_MAPPING_FILE",
+    None,
+)
+
 
 class CanonicalMapper:
 
     def __init__(
         self,
-        mapping_file="config/canonical_mapping.json"
+        mapping_file=None
     ):
+
+        mapping_file = mapping_file or DEFAULT_CANONICAL_MAPPING_FILE
+
+        if mapping_file is None:
+            raise ValueError(
+                "No mapping_file provided and Config.settings has no "
+                "CANONICAL_MAPPING_FILE defined. Add "
+                "CANONICAL_MAPPING_FILE = BASE_DIR / 'Config' / "
+                "'canonical_mapper.json' to Config/settings.py."
+            )
 
         with open(
             mapping_file,
@@ -17,7 +39,7 @@ class CanonicalMapper:
 
             self.mapping_rules = json.load(f)
 
-    def apply(self, df):
+    def map(self, df):
 
         rename_dict = {}
 
